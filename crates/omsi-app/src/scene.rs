@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use glam::{DVec2, DVec3, Mat4};
 use hashbrown::HashMap;
 use omsi_geometry::{
-    build_spline_mesh, build_terrain_mesh, mesh_from_o3d, object_rotation, MeshData, SplineCurve,
-    TileSurface,
+    build_spline_mesh_seeded, build_terrain_mesh, mesh_from_o3d, object_rotation, MeshData,
+    SplineCurve, TileSurface,
 };
 use omsi_map::{tile_size, GlobalCfg, Terrain};
 use omsi_model::{MaterialDef, MeshDef, Model};
@@ -2916,7 +2916,10 @@ impl World {
                 let b = mesh_bounds(&hp, &Mat4::IDENTITY, origin);
                 out.drive.push((hp, b));
             }
-            let mesh = build_spline_mesh(&st.def, &curve, s.mirror, origin);
+            let patchwork_seed = (s.id as u32)
+                ^ (tx as u32).wrapping_mul(0x9e37_79b9)
+                ^ (ty as u32).wrapping_mul(0x85eb_ca6b);
+            let mesh = build_spline_mesh_seeded(&st.def, &curve, s.mirror, origin, patchwork_seed);
             if debug_splines {
                 let (lo, hi) = mesh.positions.iter().fold(
                     (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),

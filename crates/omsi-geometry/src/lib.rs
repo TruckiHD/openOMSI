@@ -207,6 +207,17 @@ impl SplineCurve {
 /// Extrude a spline definition along a map curve into a mesh (one material slot per texture).
 /// Positions are relative to `origin` (f64 subtraction keeps precision on large maps).
 pub fn build_spline_mesh(def: &Spline, curve: &SplineCurve, mirror: bool, origin: DVec3) -> MeshData {
+    build_spline_mesh_seeded(def, curve, mirror, origin, 0)
+}
+
+/// As [`build_spline_mesh`], with the map placement seed used by `[patchwork_chain]`.
+pub fn build_spline_mesh_seeded(
+    def: &Spline,
+    curve: &SplineCurve,
+    mirror: bool,
+    origin: DVec3,
+    patchwork_seed: u32,
+) -> MeshData {
     let mut mesh = MeshData::default();
     if curve.length <= 0.0 {
         return mesh;
@@ -221,38 +232,191 @@ pub fn build_spline_mesh(def: &Spline, curve: &SplineCurve, mirror: bool, origin
             continue;
         }
         let first_index = mesh.indices.len() as u32;
-        let base = mesh.positions.len() as u32;
-        let pn = profile.points.len() as u32;
-        for &s in &stations {
-            for pt in &profile.points {
-                let x = pt.x as f64 * mirror_sign;
-                let p = curve.offset_point(s, x, pt.z as f64) - origin;
-                mesh.positions.push(p.as_vec3());
-                mesh.normals.push(Vec3::Z);
-                let v = if pt.v_scale != 0.0 { s as f32 * pt.v_scale } else { 0.0 };
-                mesh.uvs.push(Vec2::new(pt.u, v));
-            }
-        }
-        for i in 0..n as u32 {
-            for j in 0..pn - 1 {
-                let a = base + i * pn + j;
-                let b = a + 1;
-                let c = a + pn;
-                let d = c + 1;
-                // counter-clockwise seen from above, so the computed normals point up
-                // (profile points run left to right, stations forward along the curve)
-                if mirror {
-                    mesh.indices.extend_from_slice(&[a, c, b, b, c, d]);
-                } else {
-                    mesh.indices.extend_from_slice(&[a, b, c, b, d, c]);
+        let chain = def
+            .textures
+            .get(profile.texture)
+            .and_then(|t| t.patchwork.as_ref());
+        let patchwork = chain
+            .and_then(|c| plan_patchwork_tiles(c, curve.length as f32, patchwork_seed));
+        if let (Some(chain), Some((panels, tiles))) = (chain, patchwork) {
+            for tile in tiles {
+                let tile_length = (tile.end - tile.begin) as f64;
+                if tile_length <= 0.0 {
+                    continue;
                 }
+                let tile_begin = tile.begin as f64;
+                let count = ((tile_length / step).ceil() as usize).max(1);
+                let tile_stations: Vec<f64> = (0..=count)
+                    .map(|i| tile_begin + tile_length * i as f64 / count as f64)
+                    .collect();
+                let atlas_start =
+                    (tile.atlas_index as f32 + if tile.reversed { 1.0 } else { 0.0 })
+                        / panels as f32;
+                append_spline_profile_strip(
+                    &mut mesh,
+                    &profile.points,
+                    &curve,
+                    &tile_stations,
+                    mirror,
+                    mirror_sign,
+                    origin,
+                    |s, _| {
+                        let along = ((s - tile_begin) as f32 / chain.segment_length) / panels as f32;
+                        if tile.reversed {
+                            atlas_start - along
+                        } else {
+                            atlas_start + along
+                        }
+                    },
+                );
             }
+        } else {
+            append_spline_profile_strip(
+                &mut mesh,
+                &profile.points,
+                &curve,
+                &stations,
+                mirror,
+                mirror_sign,
+                origin,
+                |s, point| {
+                    if point.v_scale != 0.0 {
+                        s as f32 * point.v_scale
+                    } else {
+                        0.0
+                    }
+                },
+            );
         }
         let count = mesh.indices.len() as u32 - first_index;
         mesh.ranges.push((first_index, count, profile.texture as u32));
     }
     compute_normals(&mut mesh);
     mesh
+}
+
+fn append_spline_profile_strip(
+    mesh: &mut MeshData,
+    points: &[omsi_scenery::sli::SplineProfilePoint],
+    curve: &SplineCurve,
+    stations: &[f64],
+    mirror: bool,
+    mirror_sign: f64,
+    origin: DVec3,
+    mut v_at: impl FnMut(f64, &omsi_scenery::sli::SplineProfilePoint) -> f32,
+) {
+    let base = mesh.positions.len() as u32;
+    let point_count = points.len() as u32;
+    for &s in stations {
+        for point in points {
+            let x = point.x as f64 * mirror_sign;
+            let p = curve.offset_point(s, x, point.z as f64) - origin;
+            mesh.positions.push(p.as_vec3());
+            mesh.normals.push(Vec3::Z);
+            mesh.uvs.push(Vec2::new(point.u, v_at(s, point)));
+        }
+    }
+    for i in 0..stations.len().saturating_sub(1) as u32 {
+        for j in 0..point_count - 1 {
+            let a = base + i * point_count + j;
+            let b = a + 1;
+            let c = a + point_count;
+            let d = c + 1;
+            // counter-clockwise seen from above, so the computed normals point up
+            // (profile points run left to right, stations forward along the curve)
+            if mirror {
+                mesh.indices.extend_from_slice(&[a, c, b, b, c, d]);
+            } else {
+                mesh.indices.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatchworkTile {
+    begin: f32,
+    end: f32,
+    atlas_index: usize,
+    reversed: bool,
+}
+
+/// Select the texture-atlas panel sequence used by OMSI's `[patchwork_chain]` directive.
+fn plan_patchwork_tiles(
+    chain: &omsi_scenery::sli::PatchworkChain,
+    length: f32,
+    seed: u32,
+) -> Option<(usize, Vec<PatchworkTile>)> {
+    let transitions = chain.chain.as_bytes();
+    let weights = chain.weights.as_bytes();
+    let invertible = chain.invertable.as_bytes();
+    let panels = transitions
+        .len()
+        .saturating_sub(1)
+        .min(weights.len())
+        .min(invertible.len());
+    let segment_length = chain.segment_length;
+    if !segment_length.is_finite()
+        || segment_length < 0.05
+        || !length.is_finite()
+        || length <= 0.0
+        || length / segment_length > 1024.0
+        || panels == 0
+        || !transitions[..=panels].iter().all(u8::is_ascii_alphabetic)
+        || !weights[..panels].iter().all(u8::is_ascii_digit)
+        || !invertible[..panels].iter().all(|&c| c == b'0' || c == b'1')
+    {
+        return None;
+    }
+
+    let mut tiles = Vec::with_capacity((length / segment_length).ceil() as usize);
+    let mut state = if seed == 0 { 0x9e37_79b9 } else { seed };
+    let mut transition = transitions[0];
+    let mut begin = 0.0_f32;
+    while begin < length {
+        let mut candidates = Vec::new();
+        let mut total = 0_u32;
+        for index in 0..panels {
+            let weight = u32::from(weights[index] - b'0');
+            if weight == 0 {
+                continue;
+            }
+            if transitions[index] == transition {
+                candidates.push((index, false, weight, transitions[index + 1]));
+                total += weight;
+            }
+            if invertible[index] == b'1' && transitions[index + 1] == transition {
+                candidates.push((index, true, weight, transitions[index]));
+                total += weight;
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mut pick = state % total;
+        let mut chosen = *candidates.last()?;
+        for candidate in candidates {
+            if pick < candidate.2 {
+                chosen = candidate;
+                break;
+            }
+            pick -= candidate.2;
+        }
+        let end = length.min(begin + segment_length);
+        if end <= begin {
+            return None;
+        }
+        tiles.push(PatchworkTile {
+            begin,
+            end,
+            atlas_index: chosen.0,
+            reversed: chosen.1,
+        });
+        transition = chosen.3;
+        begin = end;
+    }
+    Some((panels, tiles))
 }
 
 /// The surface a spline's `[heightprofile]` segments describe, extruded along the curve like

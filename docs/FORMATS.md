@@ -321,6 +321,12 @@ sits over it, so the shoreline is wherever the terrain rises through it. `.terra
 length texture scaleTexByLength patchwork_chain heightprofile profile profilepnt path path_2
 rail_enh third_rail halfcantwidth onlyeditor terrainholeprofile terrainholeprofilepnt.
 
+`[patchwork_chain]` follows a `[texture]` and has four lines: segment length in metres,
+transition labels, per-panel weights, and per-panel invertible flags (`0`/`1`). The texture's
+longitudinal atlas is split into one panel per weight; a weighted panel is selected when its
+transition matches the current label, and an invertible panel may also be traversed backwards.
+The selected panels are laid along each placed spline in fixed-length segments.
+
 `[path]` (5 lines): kind (0 street, 1 sidewalk, 2 rail), lateral offset x (right positive),
 height z, width, direction (0 along the spline, 1 backwards, 2 both). The lane runs the
 whole spline at that offset; lanes of consecutive splines meet at the ends.
