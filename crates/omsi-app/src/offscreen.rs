@@ -33,7 +33,10 @@ pub(crate) fn run_offscreen(
     let mut scene = renderer.new_scene();
     let (world, mut camera) = lan::answering_while(&mut lan_off, args.bus.as_deref(), || load_world(args, &renderer, &mut scene))?;
     let lan_seed = lan_off.as_ref().map(lan::population_seed);
-    let mut traffic = if args.traffic > 0 || args.schedule || crate::rail_drive::args_rail(args) {
+    // (a player who joins another's game draws the host's traffic in it, whatever their own
+    // count says: without it the host's cars had nowhere to go - "passengers, but no
+    // traffic" on a server)
+    let mut traffic = if args.traffic > 0 || args.schedule || crate::rail_drive::args_rail(args) || args.lan_join.is_some() {
         let mut t = traffic::Traffic::new(&args.root, &world, args.traffic)?;
         if let Some(seed) = lan_seed {
             t.set_lan_seed(seed);
@@ -129,7 +132,7 @@ pub(crate) fn run_offscreen(
         .as_deref()
         .map(|d| career::Career::load(&args.root, d))
         .unwrap_or_default();
-    let mut humans_off = if args.passengers {
+    let mut humans_off = if args.passengers || args.lan_join.is_some() {
         let mut h = humans::Humans::new(&args.root);
         if let Some(seed) = lan_seed {
             h.set_lan_seed(seed);
@@ -149,6 +152,7 @@ pub(crate) fn run_offscreen(
             .global
             .passenger_density((parse_time(&args.time) / 3600.0) as f32);
         h.time_of_day = parse_time(&args.time);
+        h.stop_targets = schedule.as_ref().map(|s| s.stop_targets());
         h.populate(&world, &renderer, &mut scene, center);
         if let Some(p) = player.as_ref() {
             if args.riders > 0 {
@@ -283,7 +287,18 @@ pub(crate) fn run_offscreen(
                     probe.z0 = base + 0.3;
                     probe.z1 = base + 3.0;
                     let wall = collision.meshes.iter().find(|m| m.parts_near(&probe, None).next().is_some()).map(|m| m.id);
-                    let _ = writeln!(f, "{li},{s:.1},{:.2},{:.2},{:.3},{},{}", p.x, p.y, p.z, g.below.map(|z| format!("{z:.4}")).unwrap_or_default(), wall.map(|w| w.to_string()).unwrap_or_default());
+                    // and beside the lane, where a bus's wheels run (1.1 m) and a lane over
+                    // (2.5 m): a ground wider than the road shows there
+                    let (q, _) = l.at((s + 0.5).min(len));
+                    let dir = (q - p).truncate().normalize_or_zero();
+                    let side: Vec<String> = [-2.5, -1.1, 1.1, 2.5]
+                        .iter()
+                        .map(|&d| {
+                            let w = p.truncate() + glam::DVec2::new(dir.y, -dir.x) * d;
+                            crate::scene::drive_probe(&world.terrains, &world.surfaces, w.x, w.y, p.z + 0.5).below.map(|z| format!("{z:.4}")).unwrap_or_default()
+                        })
+                        .collect();
+                    let _ = writeln!(f, "{li},{s:.1},{:.2},{:.2},{:.3},{},{},{}", p.x, p.y, p.z, g.below.map(|z| format!("{z:.4}")).unwrap_or_default(), wall.map(|w| w.to_string()).unwrap_or_default(), side.join(","));
                 }
                 s += 1.0;
             }
@@ -1019,6 +1034,11 @@ pub(crate) fn run_offscreen(
             log::info!(
                 "traffic health: {stuck} stuck for over a minute, {overlapping} pairs overlapping"
             );
+            if omsi_cfg::env::var_os("OMSI_DEBUG_STUCK").is_some() {
+                for c in t.cars.iter().filter(|c| c.stopped > 30.0) {
+                    log::info!("  waiting {:.0} s: car {} ({}) lane {} at ({:.1}, {:.1}) lead {:?} why {:?} {:.1} junction {}", c.stopped, c.id, c.vehicle.ty.def.type_name, c.state.lane, c.vehicle.position.x, c.vehicle.position.y, c.lead_car, c.why.0, c.why.1, c.junction_why);
+                }
+            }
             for c in t.cars.iter().filter(|c| c.stopped > 60.0).take(4) {
                 log::info!(
                     "  stuck {:.0} s at ({:.0}, {:.0}) on lane {} of {} ({}): {}",
@@ -2365,10 +2385,12 @@ pub(crate) fn run_offscreen(
                 }
             }
             // a spread sample so one long street cannot dominate
-            let step = (points.len() / 400).max(1);
+            let cap: usize = omsi_cfg::env::var("OMSI_ROAD_PHOTO_N").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+            let step = (points.len() / cap.max(1)).max(1);
             let sample: Vec<(DVec3, f64)> = points.iter().copied().zip(headings.iter().copied()).step_by(step).collect();
             let (mut green, mut checked) = (0usize, 0usize);
             let mut spots: Vec<(DVec3, [u8; 3])> = Vec::new();
+            let mut holes: Vec<(usize, DVec3, Camera)> = Vec::new();
             for (p, h) in &sample {
                 let cam = match slant {
                     Some(back) => {
@@ -2397,6 +2419,20 @@ pub(crate) fn run_offscreen(
                     },
                 };
                 let (pw, ph) = (48u32, 48u32);
+                // OMSI_HOLE_PHOTO: the same place from above down to 25 m under the lane -
+                // what shows the sky there is a hole through the world
+                if omsi_cfg::env::var_os("OMSI_HOLE_PHOTO").is_some() {
+                    // (at a slant: the lower half of the picture only, which is all under the
+                    // horizon)
+                    let deep = if slant.is_some() { Camera { near: 0.3, far: 400.0, ..cam } } else { Camera { near: 20.0, far: 65.0, ..cam } };
+                    if let Ok(px) = renderer.render_to_image(&mut scene, 96, 96, &deep, &lighting) {
+                        let from = if slant.is_some() { 48 * 96 * 4 } else { 0 };
+                        let sky = px[from..].chunks_exact(4).filter(|c| c[2] as i32 > c[0] as i32 + 30 && c[2] as i32 > c[1] as i32 + 8 && c[2] > 150).count();
+                        if sky > 3 {
+                            holes.push((sky, *p, deep));
+                        }
+                    }
+                }
                 let Ok(px) = renderer.render_to_image(&mut scene, pw, ph, &cam, &lighting) else {
                     continue;
                 };
@@ -2411,6 +2447,13 @@ pub(crate) fn run_offscreen(
                     if spots.len() < 12 {
                         spots.push((*p, [r, g, b]));
                     }
+                }
+            }
+            if omsi_cfg::env::var_os("OMSI_HOLE_PHOTO").is_some() {
+                holes.sort_by(|a, b| b.0.cmp(&a.0));
+                log::info!("hole photo: {} of {checked} places show the sky through the ground", holes.len());
+                for (n, p, c) in holes.iter().take(40) {
+                    log::info!("   {n} sky pixels at ({:.1}, {:.1}, {:.2})  (--cam {:.1},{:.1},{:.1},{:.0},{:.1},{:.0})", p.x, p.y, p.z, c.position.x, c.position.y, c.position.z, c.yaw, c.pitch, c.fov_deg);
                 }
             }
             log::info!("road photo: {green} of {checked} places along the carriageways show ground instead of road ({:.1} %)", green as f32 / checked.max(1) as f32 * 100.0);

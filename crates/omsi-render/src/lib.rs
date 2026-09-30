@@ -4,7 +4,7 @@ pub mod atmosphere;
 pub mod clouds;
 
 use anyhow::{anyhow, Context, Result};
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3, Vec4};
 use omsi_geometry::MeshData;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -366,7 +366,8 @@ struct MaterialUniform {
     /// The PBR maps beside the diffuse texture (`Scene::pbr_maps`): x has a normal map,
     /// y an occlusion, z a roughness, w a metalness channel.
     pbr: [f32; 4],
-    /// x: a screen (`MaterialExtra::screen`); y, z, w unused.
+    /// x: a screen (`MaterialExtra::screen`); y: `[matl_texadress_border]`, z its colour's
+    /// rgb packed as r * 65536 + g * 256 + b (bytes), w its alpha.
     flags: [f32; 4],
 }
 
@@ -651,6 +652,9 @@ pub struct Material {
     pub transmap: Option<(TextureId, bool)>,
     /// Sampled clamped (`[matl_texadress_clamp]`).
     clamp: bool,
+    /// Keep the exact material parameters so a CTC texture swap can change only the diffuse
+    /// map without losing map lighting, moisture, screen, or other renderer flags.
+    uniform: MaterialUniform,
     buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
@@ -709,6 +713,15 @@ pub struct MaterialExtra {
     /// 1 when the texture's `.cfg` sidecar carries `[moisture]`/`[puddles]`: the road of a
     /// junction or crossing object gets wet and collects puddles like a spline's.
     pub moisture: f32,
+    /// `[matl_transmap]` was given, whether or not its file is there: Omsi.exe raises the
+    /// material's transmap flag before it reads the name (0x7fbbf4), and with it the
+    /// `[matl_envmap]` reflection goes by the texture's alpha instead of the factor.
+    pub transmap_declared: bool,
+    /// `[matl_texadress_border]`: its colour (RGBA, 0..1). Where the (scrolled) texture
+    /// coordinates leave [0, 1] the diffuse texture reads this colour instead of its edge,
+    /// as Direct3D's border addressing does: a roller blind's band that has scrolled away
+    /// vanishes in a transparent border.
+    pub border: Option<[f32; 4]>,
 }
 
 /// The textures a material's bind group samples.
@@ -793,6 +806,13 @@ pub struct Instance {
     /// it. (Only the vehicle the camera is in was spared, by its box; every other bus showed
     /// its saloon under snow through the windows.)
     pub roof: Option<f32>,
+    /// Drawn with every slot in model order among the blended draws, as Omsi.exe draws a
+    /// model: mesh after mesh, each material subset with its own states and depth write
+    /// (0x7c32c4 -> 0x7fd6c4, DrawSubset), not its opaque parts first. Set on the models
+    /// where it matters: a blended slot that writes depth before an opaque one (a body with
+    /// `[matl_alpha] 2` listed before its interior hides the interior as in the original,
+    /// instead of showing it through the paint's alpha).
+    pub ordered: bool,
 }
 
 pub struct Scene {
@@ -1061,6 +1081,7 @@ pub struct Renderer {
     pub instant_exposure: bool,
     /// Overlay pipeline without multisampling, for drawing the HUD after the post pass.
     overlay_pipeline_1x: wgpu::RenderPipeline,
+    xr_ui_pipeline: wgpu::RenderPipeline,
     started: std::time::Instant,
     /// `[matl_texadress_clamp]`: the diffuse of the next material is sampled clamped.
     clamp_sampler: wgpu::Sampler,
@@ -1103,11 +1124,15 @@ pub struct Renderer {
     /// frame: all its meshes and LOD levels take the same one, so exactly one level of an
     /// object is drawn and it does not flip between levels with the view's jitter.
     object_sizes: std::cell::RefCell<HashMap<[u64; 4], f32>>,
+    /// Cleared and reused as the next main view's object-size history.
+    object_sizes_scratch: std::cell::RefCell<HashMap<[u64; 4], f32>>,
     /// The far shadow cascade as last drawn: its light matrix, frames since, the render
     /// origin and the sun it was drawn for.
     shadow_far_cache: std::cell::Cell<(Mat4, u32, DVec3, Vec3)>,
     /// The same for the near cascade, drawn every other frame (see `render_inner`).
     shadow_near_cache: std::cell::Cell<(Mat4, u32, DVec3, Vec3)>,
+    /// Shadow atlas matrices from the first OpenXR eye, reused by the second eye.
+    xr_shadow_cache: std::cell::Cell<Option<(DVec3, Vec3, Mat4, Mat4, Mat4)>>,
     /// Depth-only pipeline that fills its viewport with the far depth: clears the close
     /// cascade's part of the atlas when the near part is kept from the frame before.
     shadow_clear_pipeline: wgpu::RenderPipeline,
@@ -1845,7 +1870,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -3351,6 +3376,40 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let xr_ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("OpenXR spatial UI"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("xr_ui.wgsl").into()),
+        });
+        let xr_ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("OpenXR spatial UI"),
+            layout: Some(&overlay_pl),
+            vertex: wgpu::VertexState {
+                module: &xr_ui_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &xr_ui_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(premul),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         // --- render scale: the smaller 3D picture scaled up to the window
         let upscale_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("upscale"),
@@ -3438,8 +3497,10 @@ impl Renderer {
             flicker: std::cell::RefCell::new(HashMap::new()),
             cull_drawn: std::cell::RefCell::new(Vec::new()),
             object_sizes: std::cell::RefCell::new(HashMap::new()),
+            object_sizes_scratch: std::cell::RefCell::new(HashMap::new()),
             shadow_far_cache: std::cell::Cell::new((Mat4::IDENTITY, 0, DVec3::ZERO, Vec3::ZERO)),
             shadow_near_cache: std::cell::Cell::new((Mat4::IDENTITY, 0, DVec3::ZERO, Vec3::ZERO)),
+            xr_shadow_cache: std::cell::Cell::new(None),
             shadow_clear_pipeline,
             mip_pipeline,
             mip_layout,
@@ -3473,6 +3534,7 @@ impl Renderer {
             last_frame: None,
             instant_exposure: false,
             overlay_pipeline_1x,
+            xr_ui_pipeline,
             started: std::time::Instant::now(),
             ao: None,
             ao_sampler,
@@ -4021,7 +4083,7 @@ impl Renderer {
         let view = t.view.clone();
         let (w, h) = t.size;
         self.texture_aspect = Some(aspect);
-        self.render_inner(scene, &view, w, h, camera, lighting, false, Some(id));
+        self.render_inner(scene, &view, w, h, camera, lighting, false, Some(id), None, false);
         self.texture_aspect = None;
     }
 
@@ -4209,6 +4271,126 @@ impl Renderer {
         }
     }
 
+    /// Make a copy of a material with a different diffuse texture. Used by scenery CTC and
+    /// `[texchanges]` selectors: the slot's alpha, lighting, reflection, and depth settings
+    /// stay as they were, while the replacement texture may bring its own PBR maps.
+    pub fn add_material_retextured(
+        &self,
+        scene: &mut Scene,
+        base: MaterialId,
+        texture: Option<TextureId>,
+    ) -> Option<MaterialId> {
+        let (
+            alpha,
+            color,
+            unlit,
+            no_z_write,
+            no_z_check,
+            z_bias,
+            nightmap,
+            lightmap,
+            envmap,
+            env_mask,
+            bump,
+            emissive,
+            transmap,
+            clamp,
+            mut uniform,
+        ) = {
+            let src = scene.materials.get(base)?;
+            (
+                src.alpha,
+                src.color,
+                src.unlit,
+                src.no_z_write,
+                src.no_z_check,
+                src.z_bias,
+                src.nightmap,
+                src.lightmap,
+                src.envmap,
+                src.env_mask,
+                src.bump,
+                src.emissive,
+                src.transmap,
+                src.clamp,
+                src.uniform,
+            )
+        };
+        uniform.pbr = texture
+            .and_then(|id| scene.pbr_maps.get(&id))
+            .map(|maps| maps.flags)
+            .unwrap_or([0.0; 4]);
+        let slot = |t: Option<TextureId>| {
+            t.and_then(|t| scene.textures.get(t).map(|g| (t, g.gen)))
+                .unwrap_or((usize::MAX, 0))
+        };
+        let key = BindKey {
+            textures: [
+                slot(texture),
+                slot(transmap.map(|t| t.0)),
+                slot(nightmap),
+                slot(lightmap),
+                slot(envmap.map(|e| e.0)),
+                slot(env_mask),
+                slot(bump.map(|b| b.0)),
+            ],
+            clamp,
+            uniform: bytemuck::cast(uniform),
+        };
+        let (bind_group, buf) = match scene.bind_groups.get(&key) {
+            Some((bg, b)) => (bg.clone(), b.clone()),
+            None => {
+                let buf = buffer_init(
+                    &self.device,
+                    &self.queue,
+                    None,
+                    bytemuck::bytes_of(&uniform),
+                    wgpu::BufferUsages::UNIFORM,
+                );
+                let bind_group = self.material_bind_group(
+                    &scene.textures,
+                    MaterialMaps {
+                        texture,
+                        transmap,
+                        nightmap,
+                        lightmap,
+                        envmap,
+                        env_mask,
+                        bump,
+                        pbr: texture.and_then(|id| scene.pbr_maps.get(&id)).copied(),
+                    },
+                    clamp,
+                    &buf,
+                );
+                scene
+                    .bind_groups
+                    .insert(key, (bind_group.clone(), buf.clone()));
+                (bind_group, buf)
+            }
+        };
+        scene.materials.push(Material {
+            texture,
+            alpha,
+            color,
+            unlit,
+            no_z_write,
+            no_z_check,
+            z_bias,
+            nightmap,
+            lightmap,
+            envmap,
+            env_mask,
+            bump,
+            emissive,
+            transmap,
+            clamp,
+            uniform,
+            buf,
+            bind_group,
+        });
+        Some(scene.materials.len() - 1)
+    }
+
     /// Terrain material: uv is tile space, the ground texture repeats `repeats` times per
     /// tile, its detail texture `detail` times, and the optional mask (alpha 0 = cut) is
     /// sampled in tile space.
@@ -4393,7 +4575,9 @@ impl Renderer {
                 if lightmap.is_some() { 1.0 } else { 0.0 },
                 envmap.map(|e| e.1).unwrap_or(0.0),
                 moisture,
-                if env_mask.is_some() { 1.0 } else { 0.0 },
+                // bit 1: a [matl_envmap_mask]; bit 2: a [matl_transmap] (see the shaders)
+                (if env_mask.is_some() { 1.0 } else { 0.0 })
+                    + if extra.transmap_declared || transmap.is_some() { 2.0 } else { 0.0 },
             ],
             emissive: [emissive[0], emissive[1], emissive[2], if extra.rain_film { 2.0 } else if extra.glass { 1.0 } else if extra.display { -1.0 } else { 0.0 }],
             specular: extra.specular,
@@ -4404,7 +4588,15 @@ impl Renderer {
                 if extra.no_z_check { 1.0 } else { 0.0 },
             ],
             pbr: texture.and_then(|t| scene.pbr_maps.get(&t)).map(|m| m.flags).unwrap_or([0.0; 4]),
-            flags: [if extra.screen { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            flags: {
+                let b = extra.border.unwrap_or([0.0; 4]).map(|c| (c.clamp(0.0, 1.0) * 255.0).round());
+                [
+                    if extra.screen { 1.0 } else { 0.0 },
+                    if extra.border.is_some() { 1.0 } else { 0.0 },
+                    b[0] * 65536.0 + b[1] * 256.0 + b[2],
+                    b[3] / 255.0,
+                ]
+            },
         };
         let slot = |t: Option<TextureId>| {
             t.and_then(|t| scene.textures.get(t).map(|g| (t, g.gen)))
@@ -4464,6 +4656,7 @@ impl Renderer {
             emissive,
             transmap,
             clamp,
+            uniform,
             buf,
             bind_group,
         });
@@ -4790,6 +4983,7 @@ impl Renderer {
             any_distance: false,
             mirror_only: false,
             omsi_caster: false,
+            ordered: false,
             casts_shadow: true,
             roof: None,
         });
@@ -4834,6 +5028,7 @@ impl Renderer {
             any_distance: false,
             mirror_only: false,
             omsi_caster: false,
+            ordered: false,
             casts_shadow: false,
             roof: None,
         });
@@ -4921,6 +5116,13 @@ impl Renderer {
     pub fn set_omsi_caster(&self, scene: &mut Scene, instance: usize, on: bool) {
         if let Some(i) = scene.instances.get_mut(instance) {
             i.omsi_caster = on;
+        }
+    }
+
+    /// Draw an instance with all its slots in model order (see [`Instance::ordered`]).
+    pub fn set_ordered(&self, scene: &mut Scene, instance: usize, on: bool) {
+        if let Some(i) = scene.instances.get_mut(instance) {
+            i.ordered = on;
         }
     }
 
@@ -5053,11 +5255,15 @@ impl Renderer {
     }
 
     /// A dynamic alpha value is never allowed to fade an opaque body panel; only
-    /// genuinely transparent materials (blend/test) may follow the script value.
+    /// blended materials follow the script value. An alpha-tested slot is cut out by its
+    /// texture or transmap alone: the Thüringer Wald buses put `[alphascale]
+    /// Envir_Brightness` on their transmapped body and roof (`[matl_alpha] 1`), which is 0
+    /// at night, and scaled by it the whole roof went at dusk - with alpha to coverage
+    /// under MSAA the colour pass drew none of its samples - while in OMSI it stays.
     pub fn clamp_slot_alpha(alpha: f32, material_alpha: AlphaMode) -> f32 {
         match material_alpha {
-            AlphaMode::Opaque => 1.0,
-            _ => alpha,
+            AlphaMode::Opaque | AlphaMode::Test => 1.0,
+            AlphaMode::Blend => alpha,
         }
     }
 
@@ -6343,7 +6549,136 @@ impl Renderer {
         camera: &Camera,
         lighting: &Lighting,
     ) {
-        self.render_inner(scene, target, width, height, camera, lighting, true, None);
+        self.render_inner(scene, target, width, height, camera, lighting, true, None, None, false);
+    }
+
+    /// Render one OpenXR view using the headset's asymmetric projection matrix.
+    /// The matrix uses the same reversed depth range as the desktop camera. The
+    /// second eye reuses the first eye's shadow atlas when both share an origin.
+    pub fn render_xr_eye(
+        &mut self,
+        scene: &mut Scene,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        camera: &Camera,
+        lighting: &Lighting,
+        projection: Mat4,
+        second_eye: bool,
+    ) {
+        self.render_inner(scene, target, width, height, camera, lighting, false, None, Some(projection), second_eye);
+    }
+
+    /// Composite the shared game menu and a world-positioned pointer into each eye.
+    /// Eye-specific positions make the menu fuse into one virtual panel.
+    pub fn render_xr_ui(
+        &self,
+        scene: &Scene,
+        eyes: &[wgpu::TextureView; 2],
+        desktop_size: (u32, u32),
+        eye_size: (u32, u32),
+        menu_range: std::ops::Range<usize>,
+        menu_transforms: [Mat4; 2],
+        cursor_overlay: Option<usize>,
+        tooltip_overlay: Option<usize>,
+        cursor_transforms: [Option<Mat4>; 2],
+    ) {
+        let Some(menu) = scene.overlays.get(menu_range) else { return };
+        if menu.is_empty() && cursor_transforms.iter().all(Option::is_none) {
+            return;
+        }
+        let (w, h) = (desktop_size.0.max(1) as f32, desktop_size.1.max(1) as f32);
+        let (eye_w, eye_h) = (eye_size.0.max(1) as f32, eye_size.1.max(1) as f32);
+        let prepare = |id: &TextureId, quad: [Vec4; 4]| {
+            let texture = scene.textures.get(*id)?;
+            let mut uniform = [0.0f32; 20];
+            for (index, corner) in quad.iter().enumerate() {
+                uniform[index * 4..index * 4 + 4].copy_from_slice(&corner.to_array());
+            }
+            uniform[16] = scene.premultiplied.contains(id) as u8 as f32;
+            let buffer = buffer_init(&self.device, &self.queue, Some("OpenXR menu rectangle"), bytemuck::cast_slice(&uniform), wgpu::BufferUsages::UNIFORM);
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("OpenXR menu rectangle"),
+                layout: &self.overlay_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture.view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sky_sampler) },
+                ],
+            });
+            Some((buffer, group))
+        };
+        let mut prepared = [Vec::new(), Vec::new()];
+        for eye in 0..2 {
+            for (index, (id, rect)) in menu.iter().enumerate() {
+                // The first rectangle dims the view. Every other rectangle is
+                // projected from the same menu plane in world space.
+                let transform = if index == 0 && rect[0] <= 0.0 && rect[1] <= 0.0 && rect[2] >= w && rect[3] >= h {
+                    Mat4::IDENTITY
+                } else {
+                    menu_transforms[eye]
+                };
+                let x0 = rect[0] / w * 2.0 - 1.0;
+                let y0 = 1.0 - rect[1] / h * 2.0;
+                let x1 = rect[2] / w * 2.0 - 1.0;
+                let y1 = 1.0 - rect[3] / h * 2.0;
+                let quad = [
+                    transform * Vec4::new(x0, y0, 0.0, 1.0),
+                    transform * Vec4::new(x1, y0, 0.0, 1.0),
+                    transform * Vec4::new(x1, y1, 0.0, 1.0),
+                    transform * Vec4::new(x0, y1, 0.0, 1.0),
+                ];
+                if let Some(item) = prepare(id, quad) { prepared[eye].push(item); }
+            }
+            if let (Some(index), Some(transform)) = (cursor_overlay, cursor_transforms[eye]) {
+                if let Some((id, rect)) = scene.overlays.get(index) {
+                    let half_x = (rect[2] - rect[0]) / eye_w;
+                    let half_y = (rect[3] - rect[1]) / eye_h;
+                    let quad = [
+                        transform * Vec4::new(-half_x, half_y, 0.0, 1.0),
+                        transform * Vec4::new(half_x, half_y, 0.0, 1.0),
+                        transform * Vec4::new(half_x, -half_y, 0.0, 1.0),
+                        transform * Vec4::new(-half_x, -half_y, 0.0, 1.0),
+                    ];
+                    if let Some(item) = prepare(id, quad) { prepared[eye].push(item); }
+                }
+                if let Some((id, rect)) = tooltip_overlay.and_then(|i| scene.overlays.get(i)) {
+                    let pointer_width = scene.overlays.get(index).map(|(_, r)| r[2] - r[0]).unwrap_or(24.0);
+                    let left = (pointer_width * 0.5 + 8.0) * 2.0 / eye_w;
+                    let right = left + (rect[2] - rect[0]) * 2.0 / eye_w;
+                    let bottom = -(rect[3] - rect[1]) * 2.0 / eye_h;
+                    let quad = [
+                        transform * Vec4::new(left, 0.0, 0.0, 1.0),
+                        transform * Vec4::new(right, 0.0, 0.0, 1.0),
+                        transform * Vec4::new(right, bottom, 0.0, 1.0),
+                        transform * Vec4::new(left, bottom, 0.0, 1.0),
+                    ];
+                    if let Some(item) = prepare(id, quad) { prepared[eye].push(item); }
+                }
+            }
+        }
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("OpenXR menu") });
+        for (eye, target) in eyes.iter().enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("OpenXR menu"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.xr_ui_pipeline);
+            for (_, group) in &prepared[eye] {
+                pass.set_bind_group(0, group, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        }
+        self.queue.submit(Some(encoder.finish()));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6357,6 +6692,8 @@ impl Renderer {
         lighting: &Lighting,
         with_overlays: bool,
         exclude_texture: Option<TextureId>,
+        projection: Option<Mat4>,
+        second_eye: bool,
     ) {
         // test hook for a lost device (a driver reset): its resources are taken away and
         // the session has to end in order
@@ -6544,7 +6881,15 @@ impl Renderer {
         }
         // sun shadow map: an orthographic box around the camera, looking along the sun
         let sun = lighting.sun_dir.normalize_or_zero();
-        let shadows = with_overlays && lighting.casts_sun_shadows();
+        let shadows = (with_overlays || projection.is_some()) && lighting.casts_sun_shadows();
+        let shared_xr_shadows = if second_eye && shadows {
+            self.xr_shadow_cache
+                .get()
+                .filter(|(origin, previous_sun, _, _, _)| *origin == scene.render_origin && *previous_sun == sun)
+        } else {
+            None
+        };
+        let draw_shadows = shadows && shared_xr_shadows.is_none();
         let light_matrix = |range: f32| {
             // Snap the centre to whole texels so the map does not shimmer while driving.
             let texel = range * 2.0 / self.options.shadow_size as f32;
@@ -6570,14 +6915,16 @@ impl Renderer {
         let near_wanted = light_matrix(SHADOW_RANGE);
         let (near_m, near_age, near_origin, near_sun) = self.shadow_near_cache.get();
         let near_jumped = (near_m.project_point3(cam_rel) - near_wanted.project_point3(cam_rel)).length() > 0.03;
-        let redraw_near = shadows
+        let redraw_near = draw_shadows
             && (near_age >= 1
                 || near_jumped
                 || near_m == Mat4::IDENTITY
                 || near_origin != scene.render_origin
                 || near_sun.dot(sun) < 0.99999
                 || omsi_cfg::env::var_os("OMSI_SHADOW_NEAR_EVERY_FRAME").is_some());
-        let light_view_proj = if !shadows {
+        let light_view_proj = if let Some((_, _, near, _, _)) = shared_xr_shadows {
+            near
+        } else if !shadows {
             near_wanted
         } else if redraw_near {
             self.shadow_near_cache.set((near_wanted, 0, scene.render_origin, sun));
@@ -6586,7 +6933,9 @@ impl Renderer {
             self.shadow_near_cache.set((near_m, near_age + 1, near_origin, near_sun));
             near_m
         };
-        let light_view_proj_close = light_matrix(SHADOW_RANGE_CLOSE);
+        let light_view_proj_close = shared_xr_shadows
+            .map(|(_, _, _, _, close)| close)
+            .unwrap_or_else(|| light_matrix(SHADOW_RANGE_CLOSE));
         // The far cascade (700 m, metre-sized texels) is drawn every 4th frame, or at once
         // when the camera has left the middle of the one drawn, the sun has moved or the
         // render origin has jumped (its matrix is relative to that). Drawn every frame it
@@ -6595,7 +6944,7 @@ impl Renderer {
         let far_wanted = light_matrix(SHADOW_RANGE_FAR);
         let (far_m, far_age, far_origin, far_sun) = self.shadow_far_cache.get();
         let far_moved = (far_m.project_point3(cam_rel) - far_wanted.project_point3(cam_rel)).length() > 0.12;
-        let redraw_far = shadows
+        let redraw_far = draw_shadows
             && (far_age >= 3
                 || far_moved
                 || far_m == Mat4::IDENTITY
@@ -6605,8 +6954,11 @@ impl Renderer {
         if redraw_far && omsi_cfg::env::var_os("OMSI_DEBUG_SHADOW_FAR").is_some() {
             log::info!("far shadow redrawn: age {far_age} moved {far_moved} origin {} sun {:.6}", far_origin != scene.render_origin, far_sun.dot(sun));
         }
-        // (only the main view draws shadows; the mirrors and the probe leave the cache be)
-        let light_view_proj_far = if !shadows {
+        // The desktop view and the first XR eye maintain this cache; mirrors and
+        // the second XR eye leave it alone.
+        let light_view_proj_far = if let Some((_, _, _, far, _)) = shared_xr_shadows {
+            far
+        } else if !shadows {
             far_wanted
         } else if redraw_far {
             self.shadow_far_cache.set((far_wanted, 0, scene.render_origin, sun));
@@ -6615,9 +6967,20 @@ impl Renderer {
             self.shadow_far_cache.set((far_m, far_age + 1, far_origin, far_sun));
             far_m
         };
+        if projection.is_some() && !second_eye && shadows {
+            self.xr_shadow_cache.set(Some((
+                scene.render_origin,
+                sun,
+                light_view_proj,
+                light_view_proj_far,
+                light_view_proj_close,
+            )));
+        }
         // where the sun stands on the screen (camera uniform post.zw; no shader reads it
         // since the light shafts were removed)
-        let vp_mat = camera.view_proj(aspect, ro);
+        let vp_mat = projection
+            .map(|p| p * Mat4::look_to_rh((camera.position - ro).as_vec3(), camera.forward(), camera.up()))
+            .unwrap_or_else(|| camera.view_proj(aspect, ro));
         let sun_clip = vp_mat * (cam_rel + sun * 5000.0).extend(1.0);
         let sun_ndc = if sun_clip.w > 0.0 {
             Vec3::new(sun_clip.x / sun_clip.w, sun_clip.y / sun_clip.w, 1.0)
@@ -6639,7 +7002,7 @@ impl Renderer {
                 // shadow map's share of its half of the atlas)
                 self.options.shadow_size.min(SHADOW_CLOSE_MAX) as f32 / self.options.shadow_size.max(1) as f32,
             ],
-            view_proj: camera.view_proj(aspect, ro).to_cols_array_2d(),
+            view_proj: vp_mat.to_cols_array_2d(),
             cam_pos: cam_rel.extend(1.0).to_array(),
             // (modulo the shaders' PATTERN_PERIOD, 1000 m: the patterns repeat with it, and
             // the whole map coordinate has no precision left for them in 32 bits)
@@ -6757,7 +7120,7 @@ impl Renderer {
             if d <= radius { f32::MAX } else { 2.0 * radius / (d.max(0.01) * lod_fov) }
         };
         for cascade in 0..3usize {
-            if !shadows || (cascade == 1 && !redraw_far) || (cascade == 0 && !redraw_near) {
+            if !draw_shadows || (cascade == 1 && !redraw_far) || (cascade == 0 && !redraw_near) {
                 continue;
             }
             // casters within the light box (no road surfaces, no blended glass, nothing
@@ -6892,10 +7255,23 @@ impl Renderer {
             );
         }
         stage(self, "shadow items", "mirror.shadow items");
-        // frustum culling by bounding sphere in view space
+        // Frustum culling by bounding sphere in view space. OpenXR projections
+        // are asymmetric; the desktop field of view must not clip an eye's
+        // wider side as the head turns.
         let view = Mat4::look_to_rh(cam_rel, camera.forward(), camera.up());
-        let tan_y = (camera.fov_deg.to_radians() * 0.5).tan();
-        let tan_x = tan_y * aspect;
+        let (tan_x, tan_y) = if let Some(p) = projection {
+            (
+                ((p.z_axis.x - 1.0) / p.x_axis.x)
+                    .abs()
+                    .max(((p.z_axis.x + 1.0) / p.x_axis.x).abs()),
+                ((p.z_axis.y - 1.0) / p.y_axis.y)
+                    .abs()
+                    .max(((p.z_axis.y + 1.0) / p.y_axis.y).abs()),
+            )
+        } else {
+            let tan_y = (camera.fov_deg.to_radians() * 0.5).tan();
+            (tan_y * aspect, tan_y)
+        };
         let cos_y = 1.0 / (1.0 + tan_y * tan_y).sqrt();
         let cos_x = 1.0 / (1.0 + tan_x * tan_x).sqrt();
         // nothing behind the fog is drawn: where the fog has swallowed 99 % of a thing
@@ -6948,17 +7324,30 @@ impl Renderer {
         // One thread: a few nanoseconds an instance. Spread over the worker pool the
         // hand-over cost more than the work (5 ms a frame for 8 500 instances while the
         // traffic's scripts kept the workers busy).
-        // (the main view's last picture, for the hysteresis)
-        let drawn_before = if with_overlays { std::mem::take(&mut *self.cull_drawn.borrow_mut()) } else { Vec::new() };
+        // (the main view's last picture, for the hysteresis; the headset's eyes are main
+        // views too: without their previous draw list small meshes and LODs blinked at
+        // their thresholds while the head turned)
+        let main_view = with_overlays || projection.is_some();
+        let mut drawn_before = if main_view {
+            std::mem::take(&mut *self.cull_drawn.borrow_mut())
+        } else {
+            Vec::new()
+        };
         let was_drawn = |i: usize| drawn_before.get(i / 64).is_some_and(|w| w & (1u64 << (i % 64)) != 0);
-        let sizes_before = if with_overlays { std::mem::take(&mut *self.object_sizes.borrow_mut()) } else { HashMap::new() };
-        let sizes_now: std::cell::RefCell<HashMap<[u64; 4], f32>> = Default::default();
+        let (mut sizes_before, mut sizes_now) = if main_view {
+            let sizes_before = std::mem::take(&mut *self.object_sizes.borrow_mut());
+            let mut sizes_now = std::mem::take(&mut *self.object_sizes_scratch.borrow_mut());
+            sizes_now.clear();
+            (sizes_before, sizes_now)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
         let visible: Vec<(usize, f32, bool)> = {
             (0..scene.instances.len())
                 .filter_map(|i| {
                     let inst = &scene.instances[i];
                     let m = &scene.meshes[inst.mesh];
-                    if m.ranges.is_empty() || !inst.visible || (inst.mirror_only && with_overlays) {
+                    if m.ranges.is_empty() || !inst.visible || (inst.mirror_only && main_view) {
                         return None;
                     }
                     let (c, r) = Self::bounding_sphere(scene, inst);
@@ -7023,8 +7412,8 @@ impl Renderer {
                                 Some(&last) if fresh > last * 0.94 && fresh < last * 1.06 => last,
                                 _ => fresh,
                             };
-                            if with_overlays {
-                                sizes_now.borrow_mut().insert(key, size);
+                            if main_view {
+                                sizes_now.insert(key, size);
                             }
                             size
                         }
@@ -7058,15 +7447,18 @@ impl Renderer {
                 })
                 .collect()
         };
-        if with_overlays {
-            *self.object_sizes.borrow_mut() = sizes_now.into_inner();
+        if main_view {
+            *self.object_sizes.borrow_mut() = sizes_now;
+            sizes_before.clear();
+            *self.object_sizes_scratch.borrow_mut() = sizes_before;
         }
-        if with_overlays {
-            let mut bits = vec![0u64; scene.instances.len().div_ceil(64)];
+        if main_view {
+            drawn_before.resize(scene.instances.len().div_ceil(64), 0);
+            drawn_before.fill(0);
             for &(i, _, _) in &visible {
-                bits[i / 64] |= 1u64 << (i % 64);
+                drawn_before[i / 64] |= 1u64 << (i % 64);
             }
-            *self.cull_drawn.borrow_mut() = bits;
+            *self.cull_drawn.borrow_mut() = drawn_before;
         }
         // OMSI_DEBUG_FLICKER: a near instance in view in two frames running that is drawn in
         // one and not in the other - the objects blinking in and out as the view moves
@@ -7160,6 +7552,10 @@ impl Renderer {
             let mut blended: Vec<usize> = Vec::new();
             for &(i, _, _) in &visible {
                 let inst = &scene.instances[i];
+                if inst.ordered {
+                    blended.push(i);
+                    continue;
+                }
                 let mut has_blend = false;
                 let cull = culls_back_faces(scene, inst);
                 for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate() {
@@ -7296,7 +7692,7 @@ impl Renderer {
                 for (ri, (_, _, slot)) in scene.meshes[inst.mesh].ranges.iter().enumerate() {
                     let mat_id = inst.materials.get(*slot as usize).copied().unwrap_or(0);
                     let mat = &scene.materials[mat_id];
-                    if (mat.alpha != AlphaMode::Blend && !mat.no_z_check)
+                    if (mat.alpha != AlphaMode::Blend && !mat.no_z_check && !inst.ordered)
                         || exclude_texture.is_some_and(|t| mat.uses_texture(t))
                     {
                         continue;
@@ -7319,7 +7715,10 @@ impl Renderer {
                     // the whole bus (the steering wheel in front of the counter, the body over
                     // the shadow), so it is drawn with the surfaces' depth bias instead: on
                     // top of its base, behind whatever really stands in front of it.
-                    let kind = if mat.no_z_write || mat.no_z_check {
+                    let kind = if mat.alpha != AlphaMode::Blend && !mat.no_z_check {
+                        // (a model drawn in order: its opaque and cut-out slots too)
+                        kind_of(mat.alpha)
+                    } else if mat.no_z_write || mat.no_z_check {
                         PIPE_BLEND_NO_WRITE
                     } else {
                         PIPE_BLEND
@@ -7404,7 +7803,7 @@ impl Renderer {
                 label: Some("picture"),
             });
         for cascade in [0usize, 1] {
-            if !shadows || (cascade == 1 && !redraw_far) {
+            if !draw_shadows || (cascade == 1 && !redraw_far) {
                 continue;
             }
             let view = if cascade == 0 {
@@ -9183,6 +9582,16 @@ impl<'w> SurfaceState<'w> {
         }
         self.surface.configure(&renderer.device, &self.config);
     }
+
+    pub fn set_vsync(&mut self, renderer: &Renderer, enabled: bool) {
+        let mode = if enabled { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        if self.config.present_mode == mode || renderer.device_lost().is_some() {
+            return;
+        }
+        self.config.present_mode = mode;
+        self.config.desired_maximum_frame_latency = if enabled { 1 } else { 2 };
+        self.surface.configure(&renderer.device, &self.config);
+    }
 }
 
 /// Re-export so the app does not need to depend on winit's window type path.
@@ -9289,6 +9698,7 @@ impl Renderer {
             emissive: [0.0; 3],
             transmap: None,
             clamp: false,
+            uniform: <MaterialUniform as bytemuck::Zeroable>::zeroed(),
             buf,
             bind_group,
         };
@@ -9493,6 +9903,7 @@ mod tests {
             ("ssao", include_str!("ssao.wgsl").to_string()),
             ("upscale", include_str!("upscale.wgsl").to_string()),
             ("mip", include_str!("mip.wgsl").to_string()),
+            ("xr_ui", include_str!("xr_ui.wgsl").to_string()),
         ];
         let sizes: &[(&str, usize)] = &[
             ("Enhanced", std::mem::size_of::<EnhancedUniform>()),
@@ -9708,7 +10119,8 @@ mod tests {
     fn opaque_materials_ignore_dynamic_alpha() {
         assert_eq!(Renderer::clamp_slot_alpha(0.0, AlphaMode::Opaque), 1.0);
         assert_eq!(Renderer::clamp_slot_alpha(0.35, AlphaMode::Opaque), 1.0);
-        assert_eq!(Renderer::clamp_slot_alpha(0.35, AlphaMode::Test), 0.35);
+        assert_eq!(Renderer::clamp_slot_alpha(0.0, AlphaMode::Test), 1.0);
+        assert_eq!(Renderer::clamp_slot_alpha(0.35, AlphaMode::Test), 1.0);
         assert_eq!(Renderer::clamp_slot_alpha(0.85, AlphaMode::Blend), 0.85);
     }
 }

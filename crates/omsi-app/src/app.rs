@@ -8,6 +8,8 @@ pub(crate) struct App {
     pub(crate) window: Option<Arc<Window>>,
     pub(crate) surface: Option<SurfaceState<'static>>,
     pub(crate) renderer: Option<Renderer>,
+    #[cfg(windows)]
+    pub(crate) vr: Option<crate::openxr::Vr>,
     pub(crate) scene: Option<Scene>,
     pub(crate) camera: Option<Camera>,
     pub(crate) player: Option<Player>,
@@ -68,6 +70,12 @@ pub(crate) struct App {
     /// Sounds of the world around the camera (rain, footsteps).
     pub(crate) ambience: Option<ambience::Ambience>,
     pub(crate) cursor: (f32, f32),
+    /// Last Windows mouse position used for the unbounded VR cockpit pointer.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) vr_cursor_physical: Option<(f32, f32)>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) vr_cursor_warp_pending: Option<(f32, f32)>,
+    pub(crate) window_focused: bool,
     pub(crate) keys: hashbrown::HashSet<KeyCode>,
     /// Door trigger groups currently held by the Shift+number shortcut. Keeping the
     /// release until physical key-up prevents latched button states and door chatter.
@@ -75,6 +83,9 @@ pub(crate) struct App {
     pub(crate) last: Instant,
     pub(crate) speed: f32,
     pub(crate) mouse_look: bool,
+    /// Right mouse button toggles the headset picture zoom.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) vr_zoom_active: bool,
     /// The cockpit switch the cursor is over, shown in the HUD.
     pub(crate) hover: Option<String>,
     /// The part under the cursor when it is not a switch, so the HUD can say so.
@@ -177,7 +188,7 @@ pub(crate) struct App {
     pub(crate) pending_time: Option<f64>,
     /// The play time (`clock.run_time`) the last situation was saved at.
     pub(crate) autosave_t: f64,
-    /// OMSI's timetable window (`view_set_schedule`, Shift+Insert).
+    /// OMSI's timetable window (`view_set_schedule`, Insert).
     pub(crate) timetable: bool,
     /// The left button is held on a switch: mouse movement turns it.
     pub(crate) dragging: bool,
@@ -206,6 +217,10 @@ pub(crate) struct App {
     pub(crate) career: career::Career,
     /// How wet the roads are (0..1), built up by rain and dried by the sun.
     pub(crate) wetness: f32,
+    /// A change of weather coming in (see `weather_cycle`).
+    pub(crate) weather_blend: Option<crate::weather_cycle::Blend>,
+    /// The weather cycle, when the weather chosen is `cycle`.
+    pub(crate) weather_cycle: Option<crate::weather_cycle::Cycle>,
     /// The mouse cursor currently shows the hand (it is over a switch).
     pub(crate) cursor_kind: u8,
     pub(crate) settings: settings::Settings,
@@ -236,13 +251,20 @@ pub(crate) struct App {
 }
 
 impl App {
+    #[cfg(windows)]
+    pub(crate) fn vr_active(&self) -> bool { self.vr.is_some() }
+
+    #[cfg(not(windows))]
+    pub(crate) fn vr_active(&self) -> bool { false }
+
     pub(crate) fn resumed_impl(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(window) = self.window.clone() {
             // back from the background (a phone): the window's surface is made again
             if self.surface.is_none() {
                 if let Some(r) = self.renderer.as_ref() {
                     let size = window.inner_size();
-                    self.surface = SurfaceState::new_with(&self.instance, window.clone(), r, size.width.max(1), size.height.max(1), self.settings.vsync).ok();
+                    let vsync = self.settings.vsync && !self.vr_active();
+                    self.surface = SurfaceState::new_with(&self.instance, window.clone(), r, size.width.max(1), size.height.max(1), vsync).ok();
                     self.last = Instant::now();
                 }
             }
@@ -290,6 +312,13 @@ impl App {
                 return;
             }
         };
+        #[cfg(windows)]
+        if self.settings.vr_requested() {
+            match crate::openxr::Vr::new(&renderer, self.settings.vr_scale, self.settings.vr_desktop_mirror) {
+                Ok(vr) => self.vr = Some(vr),
+                Err(e) => log::error!("OpenXR could not start: {e:#}"),
+            }
+        }
         crate::lights::load_smoke_texture(&mut renderer, &self.args.root);
         crate::lights::set_corona_root(&self.args.root);
         let size = window.inner_size();
@@ -299,7 +328,7 @@ impl App {
             &renderer,
             size.width,
             size.height,
-            self.settings.vsync,
+            self.settings.vsync && !self.vr_active(),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -340,6 +369,18 @@ impl App {
         let renderer = self.renderer.take().expect("renderer");
         let mut scene = renderer.new_scene();
         self.envir = omsi_content::Envir::load(&self.args.root.join("envir.cfg")).ok();
+        // the weather cycle: a first weather that suits the month, the others after it
+        if crate::weather_cycle::is_cycle(self.args.weather.as_deref()) {
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
+            let mut c = crate::weather_cycle::Cycle::new(seed);
+            let month = start_clock(&self.args).day_month().1;
+            let all = crate::weather_cycle::installed();
+            let clear = omsi_content::weather::Weather { fog: (50000.0, 1.0), ..Default::default() };
+            let r = c.rand();
+            self.args.weather = crate::weather_cycle::pick(&all, &clear, "", month, r);
+            log::info!("weather cycle: starting with {:?}", self.args.weather);
+            self.weather_cycle = Some(c);
+        }
         self.weather = Some(load_weather(&self.args));
         // the roads start in the state this weather has already left them in, as they do
         // offscreen: a session begun in the rain used to open on a bone-dry street
@@ -497,7 +538,8 @@ impl App {
                 if let Some(d) = self.args.driver.as_deref() {
                     self.career = career::Career::load(&self.args.root, d);
                 }
-                if self.args.passengers {
+                // (and a player who joins another's game sees the host's people)
+                if self.args.passengers || self.args.lan_join.is_some() {
                     let mut h = humans::Humans::new(&self.args.root);
                     if let Some(lan) = self.lan.as_ref() {
                         h.set_lan_seed(lan::population_seed(lan));
@@ -523,7 +565,9 @@ impl App {
                     }
                     self.humans = Some(h);
                 }
-                if self.args.traffic > 0 || self.args.schedule || crate::rail_drive::args_rail(&self.args) {
+                // (a player who joins draws the host's traffic in it, whatever their own count
+                // says: the host's cars had nowhere to go without it)
+                if self.args.traffic > 0 || self.args.schedule || crate::rail_drive::args_rail(&self.args) || self.args.lan_join.is_some() {
                     match traffic::Traffic::new(&self.args.root, &w, self.args.traffic) {
                         Ok(mut t) => {
                             if let Some(lan) = self.lan.as_ref() {
