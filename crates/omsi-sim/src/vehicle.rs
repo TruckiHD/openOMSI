@@ -79,10 +79,12 @@ pub fn builtin_str_vars(root: &Path) -> Vec<String> {
 /// A bone of a `[smoothskin]` mesh: the model mesh whose animation moves it (`[setbone]
 /// name id`, the id counting the meshes of the model's first level of detail - the GN92's and
 /// the O530G's joint dummies `Gelenk_A`-`D` are its first four) and the weights of the o3d
-/// bone of that name.
+/// bone of that name. `None`: an o3d bone no `[setbone]` names, which keeps its weights and
+/// stays with the mesh itself (the root bone of an armature: the Agora's bellows hang half of
+/// many a vertex on `Armature1_Bone`, its retarder lever on `Bone`).
 #[derive(Debug, Clone, Default)]
 pub struct SkinBone {
-    pub def_index: usize,
+    pub def_index: Option<usize>,
     pub weights: Vec<(u32, f32)>,
 }
 
@@ -251,6 +253,26 @@ impl VehicleType {
         Self::load_with(root, bus_file, true)
     }
 
+    /// The box the whole model takes (least, greatest corner; y forward), None without
+    /// vertices.
+    pub fn model_box(&self) -> Option<(Vec3, Vec3)> {
+        let (lo, hi) = self
+            .mesh_boxes
+            .iter()
+            .filter(|(lo, hi)| hi.x > lo.x || hi.y > lo.y)
+            .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), (lo, hi)| (a.min(*lo), b.max(*hi)));
+        (hi.y > lo.y).then_some((lo, hi))
+    }
+
+    /// Half its length as Omsi.exe keeps it (type +0xd4): half the `[boundingbox]`'s
+    /// length, else half the model's.
+    pub fn half_length(&self) -> Option<f32> {
+        match self.def.bounding_box {
+            Some(bb) if bb[1] > 0.0 => Some(bb[1] * 0.5),
+            _ => self.model_box().map(|(lo, hi)| (hi.y - lo.y) * 0.5),
+        }
+    }
+
     /// A type for AI copies: its meshes are measured (the tyres) and let go - nothing but
     /// the upload to the GPU needs them, and a timetable fleet kept half a gigabyte of
     /// vertices on the CPU. [`VehicleType::mesh_data`] reads a mesh again.
@@ -296,30 +318,33 @@ impl VehicleType {
                 let p = mesh_path(root, &dir, &model_dir, &md.file);
                 match omsi_o3d::load_mesh(&p) {
                     Ok(m) => {
-                        let skin = if md.smooth_skin {
+                        let skin: Vec<SkinBone> = if md.smooth_skin {
                             m.bones
                                 .iter()
-                                .filter_map(|b| {
+                                .map(|b| {
                                     let id = md
                                         .bones
                                         .iter()
                                         .find(|(n, _)| {
                                             n.trim().eq_ignore_ascii_case(b.name.trim())
-                                        })?
-                                        .1;
-                                    (id >= 0).then(|| SkinBone {
-                                        def_index: start + id as usize,
+                                        })
+                                        .map(|(_, id)| *id)
+                                        .filter(|id| *id >= 0);
+                                    SkinBone {
+                                        def_index: id.map(|id| start + id as usize),
                                         weights: b
                                             .weights
                                             .iter()
                                             .map(|w| (w.vertex, w.weight))
                                             .collect(),
-                                    })
+                                    }
                                 })
                                 .collect()
                         } else {
                             Vec::new()
                         };
+                        // (a mesh none of whose bones is bound moves as a rigid one)
+                        let skin = if skin.iter().any(|b| b.def_index.is_some()) { skin } else { Vec::new() };
                         meshes.push(VehicleMesh {
                             def_index: start + i,
                             data: mesh_from_o3d(&m),
@@ -353,6 +378,18 @@ impl VehicleType {
         for c in &model.ctc {
             let d = omsi_cfg::resolve_path(&dir, &c.path);
             paint_schemes.extend(load_paint_schemes(&d));
+        }
+        // the model's own items, after the `.cti` files' (their textures in the first
+        // `[CTC]` folder, as a `.cti` of that folder has them)
+        let item_dir = model.ctc.first().map(|c| omsi_cfg::resolve_path(&dir, &c.path)).unwrap_or_else(|| dir.clone());
+        for it in &model.items {
+            match paint_schemes.last_mut().filter(|s: &&mut PaintScheme| s.name.eq_ignore_ascii_case(&it.name) && s.dir == item_dir) {
+                Some(s) => {
+                    s.textures.push((it.ctc.clone(), it.texture.clone()));
+                    s.set_vars.extend(it.set_vars.iter().cloned());
+                }
+                None => paint_schemes.push(PaintScheme { name: it.name.clone(), dir: item_dir.clone(), textures: vec![(it.ctc.clone(), it.texture.clone())], set_vars: it.set_vars.clone() }),
+            }
         }
         let texchanges = omsi_model::load_texchanges(&dir, &model.texchanges);
         let (wheel_meshes, suspension_axles) = wheel_meshes(&model, &meshes);
@@ -936,6 +973,20 @@ impl VehicleInstance {
         // line list, and some IBIS scripts branch on it.
         if let (Some(i), Some(h)) = (program.str_var("yard"), host.hof.as_ref()) {
             state.str_vars[i as usize] = h.name.clone();
+        }
+        if let Some(scheme) = host.paint_scheme {
+            let scheme = scheme.filter(|i| *i < ty.paint_schemes.len());
+            let mut put = |name: &str, v: f32| {
+                if let Some(id) = var_index.get(&name.to_ascii_lowercase()) {
+                    state.vars[*id as usize] = v;
+                }
+            };
+            put("Colorscheme", scheme.map(|i| i as f32).unwrap_or(-1.0));
+            if let Some(i) = scheme {
+                for (var, v) in &ty.paint_schemes[i].set_vars {
+                    put(var, *v);
+                }
+            }
         }
         vm.run_init(&program, &mut state, &mut host);
         let mut animators: Vec<MeshAnimator> = ty
@@ -2473,7 +2524,7 @@ pub fn compute_mesh_props(ty: &VehicleType, var: &dyn Fn(&str) -> Option<f32>) -
                             .ok()
                             .or_else(|| var(v))
                             .unwrap_or(0.0);
-                        props.slot_light[slot] = props.slot_light[slot].max(x.clamp(0.0, 1.0));
+                        props.slot_light[slot] = props.slot_light[slot].max(if x >= 0.5 { 1.0 } else { 0.0 });
                     }
                 }
             }
@@ -2671,8 +2722,10 @@ impl PropsPlan {
             for &(slot, _) in &plan.light {
                 props.slot_light[slot] = 0.0;
             }
+            // (a light map is on at its variable's 0.5 and off below - Omsi.exe skips the
+            // texture stage of one whose variable reads under 0.5, 0x7fe51f - never half lit)
             for &(slot, src) in &plan.light {
-                props.slot_light[slot] = props.slot_light[slot].max(src.value(vars, 0.0).clamp(0.0, 1.0));
+                props.slot_light[slot] = props.slot_light[slot].max(if src.value(vars, 0.0) >= 0.5 { 1.0 } else { 0.0 });
             }
             if let Some((i, value)) = plan.visible {
                 if let Some(x) = vars.get(i) {
@@ -2808,6 +2861,12 @@ pub struct TrailerPart {
 }
 
 impl TrailerPart {
+    /// Pitch (degrees, nose up), eased axle height and the track point it stands on (for
+    /// the `OMSI_DEBUG_TRAILERS` trace).
+    pub fn debug_pose(&self) -> (f32, Option<f64>, Option<DVec3>) {
+        (self.pitch, self.axle_z, self.track)
+    }
+
     pub fn new(
         ty: Arc<VehicleType>,
         main: &VehicleType,
@@ -3006,6 +3065,15 @@ impl TrailerPart {
         Mat4::from_translation(self.position.as_vec3()) * self.body_rotation()
     }
 
+    /// Position/direction of one of the part's own `.bus` cameras in world space: (eye,
+    /// yaw, pitch) - as `VehicleInstance::camera_world` for the front part.
+    pub fn camera_world(&self, cam: &omsi_vehicle::Camera) -> (DVec3, f32, f32) {
+        let local = Vec3::new(cam.pos[0], cam.pos[1], cam.pos[2]);
+        let eye = self.position + self.body_rotation().transform_point3(local).as_dvec3();
+        let heading = if self.reversed { self.heading + 180.0 } else { self.heading };
+        (eye, heading as f32 + cam.yaw, cam.pitch)
+    }
+
     /// Transform for mesh `i` relative to the part's position; a shadow blob lies on the
     /// ground under its axles (see `VehicleInstance::mesh_local_transform`).
     pub fn mesh_local_transform(&self, i: usize) -> Mat4 {
@@ -3189,7 +3257,10 @@ impl TrailerPart {
         // about the vertical axis - the stock articulation.osc's jackknife protection brakes
         // at |alpha| > 47° - and beta about the transverse axis. (The horizontal angle went
         // to beta: the protection never engaged, the bellows turned in the wrong plane.)
-        // The part in front is drawn pitched, this one level: beta is that difference.
+        // The part in front is drawn pitched, this one level: beta is that difference, the
+        // part in front's pitch less this one's. (Taken the other way round, the Agora L's
+        // joint arch and bellows - `anim_rot articulation_0_beta` - tilted away from the rear
+        // section instead of towards it, twice the angle apart at the far ring.)
         // (the pitch of the part in front as it travels, read off its rotation: forward along
         // its heading, whichever way its model is turned)
         let lead_pitch = {
@@ -3200,7 +3271,10 @@ impl TrailerPart {
         };
         let lead_pitch = if lead_pitch.abs() > 90.0 { lead_pitch - 180.0 * lead_pitch.signum() } else { lead_pitch };
         let alpha = ((lead_heading - self.heading + 540.0) % 360.0) - 180.0;
-        let beta = self.pitch as f64 - lead_pitch;
+        // (the part in front's pitch less this one's, as Omsi.exe's beta runs (0x7de798: it
+        // grows as the rear axle sinks): taken the other way round the bellows bent away
+        // from the rear section on any grade, their folds sheared and a gap opened at one end)
+        let beta = lead_pitch - self.pitch as f64;
         if let Some(id) = self.v_alpha {
             main.state.vars[id as usize] = (alpha * ARTICULATION_SIGN) as f32;
         }
@@ -3358,7 +3432,7 @@ fn skin_key(ty: &VehicleType, i: usize, transforms: &[Mat4]) -> Vec<Mat4> {
     };
     let mut key = vec![transforms.get(i).copied().unwrap_or(Mat4::IDENTITY)];
     for b in &vm.skin {
-        if let Some(k) = ty.meshes.iter().position(|m| m.def_index == b.def_index) {
+        if let Some(k) = ty.meshes.iter().position(|m| Some(m.def_index) == b.def_index) {
             key.push(transforms.get(k).copied().unwrap_or(Mat4::IDENTITY));
         }
     }
@@ -3386,7 +3460,19 @@ fn rest_transforms(animators: &[MeshAnimator], n_vars: usize) -> Vec<Mat4> {
 /// The vertices (positions, normals) of `[smoothskin]` mesh `i` with its bones where
 /// `transforms` has them, in the mesh's own frame (the renderer puts `transforms[i]` on
 /// top); `rest` are the transforms of the modelled pose. None for a mesh without bones or
-/// vertices. A vertex no bone holds stays with the mesh.
+/// vertices.
+///
+/// As in Omsi.exe, the bones move the vertices first and the mesh's own motion (its
+/// animations and its `[animparent]`) comes on top: the Agora L's rear half of the bellows
+/// (`gelenk_B`) hangs on the arch that turns by half the joint's angle and takes the same
+/// bones as the front half (a quarter and a half of it), so that its far ring ends up at
+/// the whole angle, with the rear section. Put in place of the mesh's motion, the bones
+/// held that ring at half the angle and the bellows fanned out across the bend.
+///
+/// A vertex no bone holds stays with the mesh, and so does the share of a vertex that an
+/// unbound bone holds: dropping that share and making up the rest to 1, a vertex hung half
+/// on the armature's fixed root moved all the way with the other bone - the Agora's retarder
+/// lever bent out of shape.
 pub fn skin_vertices(
     ty: &VehicleType,
     i: usize,
@@ -3405,10 +3491,15 @@ pub fn skin_vertices(
     let mut sum = vec![Mat4::ZERO; n];
     let mut total = vec![0.0f32; n];
     for b in &vm.skin {
-        let Some(k) = ty.meshes.iter().position(|m| m.def_index == b.def_index) else {
-            continue;
+        let bone = match b.def_index {
+            None => Mat4::IDENTITY,
+            Some(d) => {
+                let Some(k) = ty.meshes.iter().position(|m| m.def_index == d) else {
+                    continue;
+                };
+                transforms[k] * rest[k].inverse()
+            }
         };
-        let bone = transforms[k] * rest[k].inverse();
         for &(v, w) in &b.weights {
             let v = v as usize;
             if v < n && w.is_finite() && w > 0.0 {
@@ -3417,8 +3508,9 @@ pub fn skin_vertices(
             }
         }
     }
-    let own_inv = transforms[i].inverse();
-    let own_rest = rest[i];
+    // (the renderer puts the mesh's transform on top: in the modelled pose, the vertices
+    // are where the file has them)
+    let own_rest_inv = rest[i].inverse();
     let mut pos = Vec::with_capacity(n);
     let mut nrm = Vec::with_capacity(n);
     for v in 0..n {
@@ -3429,7 +3521,7 @@ pub fn skin_vertices(
             nrm.push(q);
             continue;
         }
-        let m = own_inv * (sum[v] * (1.0 / total[v])) * own_rest;
+        let m = own_rest_inv * (sum[v] * (1.0 / total[v]));
         pos.push(m.transform_point3(p));
         nrm.push(m.transform_vector3(q).normalize_or_zero());
     }
@@ -3842,5 +3934,102 @@ mod grip_tests {
         assert!((road_grip(2.0, -5.0) - 0.3).abs() < 1e-6);
         assert!(road_grip(1.0, -3.0) < 0.2, "black ice");
         assert_eq!(road_grip(0.0, -10.0), 0.85, "a dry road does not freeze");
+    }
+
+    /// A `[smoothskin]` vertex hung partly on an o3d bone no `[setbone]` names keeps that
+    /// share where it was modelled: the AA-FR Agora's retarder lever (`retarderhebel_2.o3d`)
+    /// splits its vertices between `Bone` (unbound) and `Bone.001` (the animated dummy), and
+    /// with the unbound share dropped the lever bent out of shape as it moved.
+    #[test]
+    fn unbound_bones_keep_their_share_of_a_vertex() {
+        use super::*;
+        use std::sync::Arc;
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_S_2d.bus");
+        if !bus.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &bus).expect("Agora S"));
+        let i = (0..ty.meshes.len())
+            .find(|&i| ty.model.meshes[ty.meshes[i].def_index].file.to_ascii_lowercase().contains("retarderhebel_2"))
+            .expect("the Agora's retarder lever");
+        let vm = &ty.meshes[i];
+        let bound = vm.skin.iter().find(|b| b.def_index.is_some()).expect("Bone.001");
+        assert!(vm.skin.iter().any(|b| b.def_index.is_none()), "the unbound Bone is kept");
+        let k = ty.meshes.iter().position(|m| Some(m.def_index) == bound.def_index).unwrap();
+        let mut v = VehicleInstance::new(ty.clone(), VehicleHost::new(crate::SimClock::default()));
+        v.update_visuals(0.02);
+        let rest = v.mesh_transforms.clone();
+        assert!(v.set_var("cp_retarder_hebel", 4.0));
+        for _ in 0..200 {
+            v.update_visuals(0.05);
+        }
+        let bone = v.mesh_transforms[k] * rest[k].inverse();
+        assert!(bone.abs_diff_eq(Mat4::IDENTITY, 1e-3) == false, "the lever's dummy did not move");
+        let (pos, _) = v.skinned(i).expect("skinned lever");
+        let mut checked = 0;
+        for &(vi, w) in &bound.weights {
+            let vi = vi as usize;
+            if !(0.2..0.8).contains(&w) {
+                continue;
+            }
+            let p = vm.data.positions[vi];
+            // (1 - w) where it was modelled, w with the bone, in the mesh's own frame
+            let want = rest[i].inverse() * (Mat4::IDENTITY * (1.0 - w) + bone * w);
+            let want = want.transform_point3(p);
+            assert!((pos[vi] - want).length() < 1e-4, "vertex {vi} (weight {w}): {:?} for {:?}", pos[vi], want);
+            checked += 1;
+        }
+        assert!(checked > 0, "no vertex shared between the two bones");
+    }
+
+    /// The joint's vertical angle turns the Agora L's arch (`anim_rot articulation_0_beta
+    /// 0.5`) and the bone its bellows' far ring hangs on half-way towards the rear section,
+    /// whichever way the front section pitches.
+    #[test]
+    fn articulation_beta_tilts_the_joint_towards_the_rear_section() {
+        use super::*;
+        use std::sync::Arc;
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_L_3d_main.bus");
+        let trail = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_L_3d_trail.bus");
+        if !bus.exists() || !trail.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = Arc::new(VehicleType::load(&root, &bus).expect("Agora L"));
+        let mut v = VehicleInstance::new(ty, VehicleHost::new(crate::SimClock::default()));
+        v.attach_trailer_ex(Arc::new(VehicleType::load(&root, &trail).expect("Agora L trail")), false);
+        v.update_visuals(0.02);
+        let find = |v: &VehicleInstance, n: &str| {
+            v.ty.meshes
+                .iter()
+                .position(|m| v.ty.model.meshes[m.def_index].file.to_ascii_lowercase().ends_with(n))
+                .expect(n)
+        };
+        let (arch, bone_b) = (find(&v, "gelenk_arch.o3d"), find(&v, "bone_b.o3d"));
+        for pitch in [4.0f32, -4.0] {
+            v.pitch = pitch;
+            for _ in 0..50 {
+                v.update_visuals(0.05);
+            }
+            // where the rear section lies, in the front section's frame
+            let rel = v.body_rotation().inverse() * v.trailers[0].body_rotation();
+            let back = rel.transform_vector3(-Vec3::Y);
+            assert!(back.z.abs() > 0.03, "the sections are not pitched apart ({back:?})");
+            for k in [arch, bone_b] {
+                let d = v.mesh_transforms[k].transform_vector3(-Vec3::Y);
+                assert!(
+                    d.z * back.z > 0.0 && d.z.abs() < back.z.abs(),
+                    "pitch {pitch}: {} points {d:?}, the rear section {back:?}",
+                    v.ty.model.meshes[v.ty.meshes[k].def_index].file
+                );
+            }
+        }
     }
 }

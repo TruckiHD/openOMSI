@@ -290,14 +290,17 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     if (terrain) {
         duv = in.uv * material.extra.z;
     }
-    var tex = textureSample(t_diffuse, s_diffuse, duv);
+    var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
     let diffuse_a = tex.a;
+    // (without the [texcoordtransX/Y] offset: the transmap, night map and light map stay
+    // in place, see fs_main)
+    let buv = in.uv - in.params.zw;
     if (terrain && material.extra.y > 0.0) {
         let det = textureSample(t_light, s_diffuse, in.uv * material.extra.y);
         tex = vec4<f32>(clamp(tex.rgb * det.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), tex.a);
     }
     if (material.params.z > 0.5) {
-        let tm = textureSample(t_trans, s_diffuse, in.uv);
+        let tm = textureSample(t_trans, s_diffuse, buv);
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
         if (terrain && material.params.x > 1.5) {
             let lum = dot(tex.rgb, vec3<f32>(0.333, 0.333, 0.333));
@@ -421,9 +424,10 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         // the pane instead of leaving a flat pale surface at normal incidence.
         rough = 0.04;
         // the pane's [matl_envmap] factor says how much it mirrors (its alpha is its
-        // transparency, never a mask): 0.4 on the Scania's panes, which the fixed 0.08
-        // left looking like empty frames
-        f0 = vec3<f32>(clamp(0.06 + 0.2 * min(material.params2.y, 1.0), 0.08, 0.26));
+        // transparency, never a mask): from glass's own 4 % up to 12 % for a factor of 1
+        // (0.4 on the Scania's panes). Up to 26 % as before, every window of every bus
+        // was a mirror - far more than the original's panes reflect (issue #176).
+        f0 = vec3<f32>(clamp(0.04 + 0.08 * min(material.params2.y, 1.0), 0.04, 0.12));
     } else if (reflective_env) {
         // Paint reflects its few per cent through a smooth clear coat; much more than a few
         // per cent is polished metal - but only where the model says so with a mask of its
@@ -431,7 +435,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         // no mask, which OMSI takes as "reflect the sphere map fully" and not as chrome:
         // read as metalness it made a Golf's bonnet a mirror, in which the envmap photo's
         // trees stood as contour lines across the paint at close range.
-        let masked = material.params2.w > 0.5;
+        let masked = (u32(material.params2.w + 0.5) & 1u) != 0u;
         metal = select(0.0, smoothstep(0.3, 0.85, refl), masked);
         f0 = mix(vec3<f32>(clamp(refl, 0.02, 0.08)), mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
         rough = mix(max(0.3 - 0.12 * smoothstep(0.0, 0.25, refl), select(0.22, 0.0, masked)), 0.14, metal);
@@ -698,7 +702,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     // other surface - added on top it lit the roads twice, with a hard edge where a road
     // met a square that is an object)
     if (material.extra.w > 0.5) {
-        let nuv = select(duv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), terrain);
+        let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), terrain);
         let switched = material.extra.w > 1.5;
         let night = select(camera.sun_color.w, 1.0, switched);
         // (a switched one is the display's own state: not dimmed with the instance's night
@@ -715,7 +719,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     }
     if (material.params2.x > 0.5 && !terrain) {
         // [matl_lightmap]: the cabin lamps and displays, visible by day as well
-        let lm = textureSample(t_light, s_diffuse, duv).rgb;
+        let lm = textureSample(t_light, s_diffuse, buv).rgb;
         emit = emit + tex.rgb * lm * clamp(in.params2.x, 0.0, 1.0) * max(enh.exposure.z * 2.0, 0.6);
     }
     if (material.emissive.w < -0.5) {
