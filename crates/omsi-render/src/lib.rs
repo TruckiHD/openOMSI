@@ -383,8 +383,6 @@ struct MaterialUniform {
     /// rgb: the D3D material's ambient colour, which takes the ambient light (C); w: 1 for
     /// a texture that is a season's snow picture (no snow laid over it), 2 the map's water
     ambient: [f32; 4],
-    /// Window mask: mesh X/Z origin and inverse size; zero disables it.
-    wipe_bounds: [f32; 4],
 }
 
 /// The maps of a PBR set found beside a diffuse texture (`foo_n.png` and the rest, see
@@ -5034,7 +5032,6 @@ impl Renderer {
                 .and_then(|t| scene.textures.get(t))
                 .is_some_and(|t| t.texture.usage().contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
         let uniform = MaterialUniform {
-            wipe_bounds: [0.0; 4],
             color,
             params: [
                 mode,
